@@ -110,7 +110,8 @@
     <!-- Guess Input Section -->
     <section id="guessInputSection" class="section">
         <h2>Guess Others' Secret Santas</h2>
-        <p>Enter the name of a person and who you think is their Secret Santa.</p>
+        <p>Enter the name of a person and who you think is their Secret Santa.<br />
+        You can guess the same person twice (2 attempts). First correct guess = 3 points, second correct guess = 2 points, and each wrong guess = -1 point.</p>
         <form id="guessInputForm">
             <label>Person's Name:
                 <input type="text" id="personGuessed" required placeholder="e.g., Carol" />
@@ -119,7 +120,7 @@
                 <input type="text" id="guessSecretSanta" required placeholder="e.g., Bob" />
             </label>
             <div class="nav-buttons">
-                <button type="submit" id="nextGuessBtn">Next</button>
+                <button type="submit" id="nextGuessBtn">Submit Guess</button>
                 <button type="button" id="seeResultsBtn">See Results</button>
             </div>
         </form>
@@ -161,7 +162,7 @@
 <!-- Firebase SDKs -->
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
-    import { getFirestore, collection, query, where, getDocs, addDoc, updateDoc, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+    import { getFirestore, collection, query, where, getDocs, addDoc, updateDoc, doc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
 
     // Replace with your Firebase config
     const firebaseConfig = {
@@ -201,7 +202,7 @@
     const resultsContent = document.getElementById('resultsContent');
 
     let currentUserName = '';
-    let personList = []; // will store the persons the current user guessed for
+    let personList = []; 
     let currentPersonIndex = 0;
 
     function showSection(section) {
@@ -226,14 +227,13 @@
         if(!gaveTo) return;
 
         const giversRef = collection(db, 'givers');
-        // Add this info to givers collection
         await addDoc(giversRef, { name: currentUserName, gaveTo });
 
         gaveToNameInput.value = '';
         showSection(guessInputSection);
     });
 
-    // On "Next" guess in guess form
+    // On submit guess
     guessInputForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const person = personGuessedInput.value.trim();
@@ -241,13 +241,24 @@
         if(!person || !guessedSanta) return;
 
         const guessesRef = collection(db, 'guesses');
+
+        // Determine attemptNumber
+        // Get how many attempts this guesser already made for this person
+        const q = query(guessesRef, where('guesserName', '==', currentUserName), where('personGuessed', '==', person));
+        const snap = await getDocs(q);
+        let attemptNumber = snap.size + 1; // If no guesses yet, attemptNumber=1; if one guess exists, attemptNumber=2
+        if (attemptNumber > 2) {
+            alert("You have already made 2 attempts for this person.");
+            return;
+        }
+
         await addDoc(guessesRef, { 
             guesserName: currentUserName, 
             personGuessed: person, 
-            guessSecretSanta: guessedSanta 
+            guessSecretSanta: guessedSanta,
+            attemptNumber: attemptNumber
         });
 
-        // Add this person to personList if not already added
         if(!personList.includes(person)) {
             personList.push(person);
         }
@@ -272,12 +283,10 @@
         const q = query(scoresRef, where('name', '==', guesserName));
         const snap = await getDocs(q);
         if (!snap.empty) {
-            // Update existing score
             const docRef = snap.docs[0].ref;
             const oldScore = snap.docs[0].data().score || 0;
             await updateDoc(docRef, { score: oldScore + increment });
         } else {
-            // Create new score entry
             await addDoc(scoresRef, { name: guesserName, score: increment });
         }
     }
@@ -297,7 +306,6 @@
         const giverQ = query(giversRef, where('gaveTo', '==', personName));
         const giverSnap = await getDocs(giverQ);
         if(!giverSnap.empty) {
-            // Assume only one doc matches
             actualGiver = giverSnap.docs[0].data().name;
         }
 
@@ -311,22 +319,77 @@
             return;
         }
 
-        // Calculate correctness and update scores
+        // Group guesses by guesserName
+        const guessesByGuesser = {};
+        allGuesses.forEach(g => {
+            const key = g.guesserName.toLowerCase();
+            if(!guessesByGuesser[key]) guessesByGuesser[key] = [];
+            guessesByGuesser[key].push(g);
+        });
+
+        // For scoring:
+        // For each guesser:
+        // Sort their attempts by attemptNumber
+        // Evaluate first attempt, then second if exists
+        // Scoring logic:
+        //  first attempt correct => 3 points
+        //  if first wrong and second correct => 2 points for second attempt
+        //  each wrong guess => -1 point
+        // If only one attempt and it's wrong => -1 point
+        // If both attempts are wrong => -1 + (-1) = -2 points
+        // If first wrong second correct => total = 2 (correct second attempt) + (-1 for first attempt wrong) = 1 point net
+        // Actually, the requirement didn’t specify subtracting -1 for the wrong attempt if the second is correct. The prompt says -1 point for wrong guessing. That should apply to both attempts independently.
+        // So final: 
+        // - If first attempt correct: 3 points (if no second attempt made, done)
+        // - If first attempt wrong (-1), second attempt correct (+2) => total 1 point
+        // - If first attempt correct and second attempt made and correct => Actually we only have two attempts max. The scenario suggests we only consider attempts until correct. If the first is correct, why guess again?
+        //   If they do guess again and it's correct, do we count both? Not specified. We'll assume a guesser shouldn't guess a second time if first is correct, but if they do, first guess correct gives 3 points, second guess correct would be ignored or considered another scenario. We'll keep it simple: once correct is found, no need second guess. If they did second guess, it's probably redundant. We'll just score attempts as stated.
+        // - If both attempts wrong => -1 + (-1) = -2 points
+        // - If first attempt wrong, no second attempt => -1 point
+
         let correctCount = 0;
-        for (const g of allGuesses) {
-            if (g.guessSecretSanta.toLowerCase() === actualGiver.toLowerCase()) {
+        let totalGuessesCount = allGuesses.length; 
+
+        for (const guesser in guessesByGuesser) {
+            let attempts = guessesByGuesser[guesser];
+            attempts.sort((a,b) => a.attemptNumber - b.attemptNumber);
+
+            let firstAttempt = attempts[0];
+            let secondAttempt = attempts[1] || null;
+
+            let scoreChange = 0;
+            // Check first attempt
+            let firstCorrect = firstAttempt.guessSecretSanta.toLowerCase() === actualGiver.toLowerCase();
+            if (firstCorrect) {
+                // First attempt correct => 3 points
+                scoreChange += 3;
                 correctCount++;
-                // Award 3 points for correct guess
-                await updateScore(g.guesserName.toLowerCase(), 3);
+            } else {
+                // First attempt wrong => -1
+                scoreChange -= 1;
+                // Check second attempt if exists
+                if (secondAttempt) {
+                    let secondCorrect = secondAttempt.guessSecretSanta.toLowerCase() === actualGiver.toLowerCase();
+                    if (secondCorrect) {
+                        // second attempt correct => 2 points
+                        scoreChange += 2;
+                        correctCount++;
+                    } else {
+                        // second attempt wrong => -1
+                        scoreChange -= 1;
+                    }
+                }
             }
+
+            await updateScore(guesser, scoreChange);
         }
 
-        let percentage = ((correctCount / allGuesses.length) * 100).toFixed(2);
+        let percentage = ((correctCount / totalGuessesCount) * 100).toFixed(2);
 
         // Show summary
         const summaryDiv = document.createElement('div');
-        summaryDiv.innerHTML = `<p>Total guesses for ${personName}: ${allGuesses.length}</p>
-                                <p>Correct guesses: ${correctCount}/${allGuesses.length} (${percentage}%)</p>`;
+        summaryDiv.innerHTML = `<p>Total guesses for ${personName}: ${totalGuessesCount}</p>
+                                <p>Correct guesses: ${correctCount}/${totalGuessesCount} (${percentage}%)</p>`;
         resultsContent.appendChild(summaryDiv);
 
         // Reveal Actual
@@ -346,21 +409,27 @@
         revealGuessesBtn.addEventListener('click', () => {
             revealGuessesBtn.disabled = true;
             guessesContainer.innerHTML = '';
-            allGuesses.forEach(guessObj => {
-                const guessDiv = document.createElement('div');
-                guessDiv.style.marginBottom = '1rem';
-                guessDiv.textContent = `Guesser: ${guessObj.guesserName} `;
-                const revealGuessBtn = document.createElement('button');
-                revealGuessBtn.textContent = 'Reveal Guess';
-                revealGuessBtn.addEventListener('click', () => {
-                    revealGuessBtn.disabled = true;
-                    const correct = guessObj.guessSecretSanta.toLowerCase() === actualGiver.toLowerCase();
-                    guessDiv.innerHTML = `Guesser: ${guessObj.guesserName} guessed: ${guessObj.guessSecretSanta} - ${correct ? 'Correct!' : 'Wrong'}`;
-                    guessDiv.classList.add(correct ? 'correct' : 'wrong');
+            // We show all attempts by all guessers
+            for (const guesser in guessesByGuesser) {
+                const attempts = guessesByGuesser[guesser];
+                attempts.sort((a,b)=> a.attemptNumber - b.attemptNumber);
+                // Display each attempt
+                attempts.forEach(att => {
+                    const guessDiv = document.createElement('div');
+                    guessDiv.style.marginBottom = '1rem';
+                    guessDiv.textContent = `Guesser: ${att.guesserName}, Attempt ${att.attemptNumber}`;
+                    const revealGuessBtn = document.createElement('button');
+                    revealGuessBtn.textContent = 'Reveal Guess';
+                    revealGuessBtn.addEventListener('click', () => {
+                        revealGuessBtn.disabled = true;
+                        const correct = att.guessSecretSanta.toLowerCase() === actualGiver.toLowerCase();
+                        guessDiv.innerHTML = `Guesser: ${att.guesserName}, Attempt ${att.attemptNumber}, guessed: ${att.guessSecretSanta} - ${correct ? 'Correct!' : 'Wrong'}`;
+                        guessDiv.classList.add(correct ? 'correct' : 'wrong');
+                    });
+                    guessDiv.appendChild(revealGuessBtn);
+                    guessesContainer.appendChild(guessDiv);
                 });
-                guessDiv.appendChild(revealGuessBtn);
-                guessesContainer.appendChild(guessDiv);
-            });
+            }
         });
         resultsContent.appendChild(revealGuessesBtn);
         resultsContent.appendChild(guessesContainer);
@@ -378,7 +447,6 @@
     });
 
     async function displayLeaderboard() {
-        // After finishing all persons, show leaderboard
         showSection(leaderboardSection);
         leaderboardTableBody.innerHTML = '';
         const scoresRef = collection(db, 'scores');
